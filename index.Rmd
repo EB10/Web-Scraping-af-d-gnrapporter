@@ -1,0 +1,276 @@
+---
+title: "Webscraping af danske banker"
+author: "Emil Bønding Wichmann"
+date: "9/6/2020"
+output: html_document
+---
+
+# Formålet med webscraping af bankernes side for tilsynsrapporter 
+Formålet med denne lille web-scraping øvelse er at vise, hvordan en basal model for indhentningen og katalogiseringen af informationer online kan se ud. Der er dermed givetvis mere effektive måder at skrive koden end tilfældet er herunder. Formålet er at vise, hvordan man kan nå hen til at have et datasæt, der indeholder information fra Finanstilsynets redegørelser fra inspektioner af banker (hentet fra pdf'er på bankernes hjemmeside), dato og navn på banken. 
+
+![image](https://user-images.githubusercontent.com/43236725/92942659-0d8c1000-f452-11ea-9377-429ac46d4b06.png)
+
+For at nå dertil er der følgende trin, som jeg vil gennemgå:  
+  
+**1. Den automatiske download af pdf'er**   
+**2. Ekstrahering af information om inspektionen fra pdf'erne**   
+**3. Sammensætningen af informationerne til et overskueligt datasæt.**
+
+Jeg har hentet informationer fra: Danske Bank, Sydbank, Spar Nord og Jyske Bank. Processen leder frem til det datasæt, der er vist i billedet herover. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, error = FALSE, message = FALSE)
+pacman::p_load(tidyverse,rvest,magrittr,janitor,stringr,textclean, pdftools,pkgutils, lubridate)
+```
+
+
+## Den automatiske download af pdf'er  
+PDF'er er svært tilgængelige i web-scraping, da de er lukkede dokumenter, der kræver download, for at man kan tilgå dem. Det udelukker, at man kan _scrape_ direkte via HTML-koden. Derfor er første skridt at definere hente genvejene til pdf filerne, der gemmer på de informationer om inspektionerne, som jeg er interesseret i.  Nedenstående kode definerer hvilken url pdf'erne befinder sig (ved større projekter vil man sætte programmet til selv at _scrape_ sig vej til de rette informationer vha. af såkaldte _crawlers_). Dernæst identificeres alle links, der indeholder teksten 'inspektion'. På den måde undgår man alle de ikke-relevante links så som 'Om os'-sider, 'Kontaktsider' osv. Som udklippet af de hentede links viser, er det kun genvejen til pdf'erne, der er hentet. Derfor skal bankens hjemmeside også defineres således, at de kan sættes sammen og pdf'erne kan hentes. 
+
+```{r, warning = FALSE , error = FALSE, message = FALSE}
+#### Danske Bank 
+url <- 'https://danskebank.com/da/investor-relations/regulering/finanstilsynet'
+rapportlinks <- url %>%
+  read_html() %>%
+  html_nodes('a') %>%
+  html_attr('href') %>%
+  grep('.pdf', ., value = T)
+
+
+### Laver links
+result <- vector('list', length = length(rapportlinks))
+for(j in 1:length(rapportlinks)) {
+  base_url <- 'https://danskebank.com'
+  # the first link
+  rapport_link <- rapportlinks[j]
+  # combine the base url with the event url
+  rapport_url <- paste0(base_url, rapport_link)
+  result[[j]] <- rapport_url
+
+}
+
+head(result)
+
+#### Denne proces gentages for de andre banker
+
+```
+
+```{r, echo=FALSE, warning = FALSE, error = FALSE, message = FALSE}
+
+url <- 'https://www.jyskebank.dk/ir/rating#tilsyn'
+rapportlinks_jb <- url %>% read_html() %>% html_nodes('a') %>% html_attr('href') %>% grep('pdf', ., value = T)
+
+
+result_jb <- vector('list', length = length(rapportlinks_jb))
+for(j in 1:length(rapportlinks_jb)) {
+  base_url <- 'https://www.jyskebank.dk'
+  # the first link
+  rapport_link <- rapportlinks_jb[j]
+  # combine the base url with the event url
+  rapport_url_jb <- paste0(base_url, rapport_link)
+  result_jb[[j]] <- rapport_url_jb
+  
+}
+
+sparnord_url <- 'https://www.sparnord.com/investor-relations/organisation/tilsyn/'
+rapportlinks_spa <- sparnord_url %>%
+  read_html() %>%
+  html_nodes('a') %>%
+  html_attr('href') %>%
+  grep('tilsyn', ., value = T)
+
+result_spa <- vector('list', length = length(rapportlinks_spa))
+for(j in 1:length(result_spa)) {
+  base_url_spa <- 'https://media.sparnord.dk/'
+  # the first link
+  rapport_link_spa <- rapportlinks_spa[j]
+  # combine the base url with the event url
+  rapport_url_spa <- paste0(base_url_spa, rapport_link_spa)
+  result_spa[[j]] <- rapport_url_spa
+  
+}
+
+sydbank_url <- 'https://www.sydbank.dk/omsydbank/investor-relations/finansinformation#info'
+rapportlinks_syd <- sydbank_url %>%
+  read_html() %>%
+  html_nodes('a') %>%
+  html_attr('href') %>%
+  grep('rede|påbud|inspektion|temainspektion|Rede', ., value = T)
+
+
+result_syd <- vector('list', length = length(rapportlinks_syd))
+for(j in 1:length(rapportlinks_syd)) {
+  sydbank_url <- 'https://www.sydbank.dk'
+  # the first link
+  rapport_links_syd <- rapportlinks_syd[j]
+  # combine the base url with the event url
+  rapport_url_syd <- paste0(sydbank_url, rapport_links_syd)
+  result_syd[[j]] <- rapport_url_syd
+  
+}
+```
+
+##Ekstrahering af information om inspektionen fra pdf'erne
+Næste skridt er at lave nogle generiske funktioner, der pakker pdf-filerne ud og gør dem læs- og søgbare. Nedenstående to funktioner gør dette. Den første pakker pdf'er ud og deler dem op i sætninger, så det er lettere at søge efter fraser og ord. Den anden funktion pakker pdf'erne ud og gemmer teksten i en enkelt 'vector'. Dette gør det lettere at finde den øverste dato, som oftest er datoen, som Finanstilsynets redegørelse er dateret til. 
+
+```{r, echo=TRUE, warning = FALSE, error = FALSE, message = FALSE}
+### Laver funktioner til at pakke hhv. datoer og tekst ud
+pdf_text_function <- function(x) {
+  pdf_text(x) %>%
+    readr::read_lines(skip_empty_rows = TRUE) %>%
+    replace_white()
+}
+pdf_text_function_udenreadlines <- function(x) {
+  pdf_text(x)%>%
+    replace_white()
+}
+```
+
+Dernæst skal funktionerne appliceres på hver enkelt pdf for hver enkelt bank. Da der fx er over 100 pdf'er på Danske Banks hjemmeside er det nemmeste at lave et såkaldt 'loop', der gentager processen for hver enkelt pdf og gemmer denne i et datasæt genereret til formålet. Herunder er to loop. Det første loop gennemgår hvert enkelt pdf hentet fra Danske Banks hjemmeside for Finanstilsyn og søger efter ord, der indikerer, at der blevet givet et påbud. Derefter gemmer den de sætninger i et nyt datasæt: 'danskebank'. Det andet loop benytter funktionen henvendt til at finde datoer for redegørelserne. For hver enkelt pdf udtrækker den mønstre, der svarer til formatet: [dato][punktum][mellemrum][ord på mindst 3 bogstaver][mellemrum][tal på 4 cifre]. Dette gemmer den automatisk i det samme datasæt. Det giver et datasæt for Danske Bank, hvor hver enkelt dato for pdf'en har et tilsvarende match med sætninger, hvor et påbud bliver beskrevet. Denne proces gentages for alle banker. 
+
+```{r, echo=TRUE,warning = FALSE, error = FALSE, message = FALSE}
+### Applicerer funktionerne på de downloadede links og søger efter mønstre i data, og placerer dem i et datasæt
+danskebank <- data_frame( Dato=character(), Påbud=character())
+for(i in 1:length(result)){
+  danskebank[i,2] <- tryCatch(pdf_text_function(result[[i]])%>%
+                    str_subset(pattern = "Banken fik påbud | fik banken påbud | fik påbud | blevet påbudt | har Finanstilsynet påbudt| påbud") %>%
+                    str_c(collapse = "|") %>%
+                    as_data_frame(), error = function(e) 1)}
+for(i in 1:length(result)){
+  danskebank[i,1] <- tryCatch(pdf_text_function_udenreadlines(result[[i]]) %>%
+                        str_extract(pattern = "[0-9]+\\.\\s[a-z][a-z][a-z]+\\s[0-9][0-9][0-9][0-9]") %>%
+                        as_data_frame(), error = function(e) 1)
+}
+```
+```{r, echo=TRUE}
+
+### Applicerer funktionerne på de downloadede links og søger effter mønstre i data, og placerer dem i et datasæt
+jyskebank <- data_frame( Dato=character(), Påbud=character() )
+for(i in 1:length(result_jb)){
+  jyskebank[i,2] <- tryCatch(pdf_text_function(result_jb[[i]])%>%
+                            str_subset(pattern = "Banken fik påbud | fik banken påbud | fik påbud | blevet påbudt | har Finanstilsynet påbudt| påbud") %>%
+                            str_c(collapse = "|") %>%
+                            as_data_frame(), error = function(e) 1)}
+for(i in 1:length(result_jb)){
+  jyskebank[i,1] <- tryCatch(pdf_text_function_udenreadlines(result_jb[[i]]) %>%
+                            str_extract(pattern = "[0-9]+\\.\\s[a-z][a-z][a-z]+\\s[0-9][0-9][0-9][0-9]") %>%
+                            as_data_frame(), error = function(e) 1)
+}
+
+sparnord <- data_frame( Dato=character(), Påbud=character() )
+for(i in 1:length(rapportlinks_spa)){
+  sparnord[i,2] <- tryCatch(pdf_text_function(rapportlinks_spa[[i]])%>%
+                               str_subset(pattern = "Banken fik påbud | fik banken påbud | fik påbud | blevet påbudt | har Finanstilsynet påbudt| påbud") %>%
+                               str_c(collapse = "|") %>%
+                               as_data_frame(), error = function(e) 1)}
+for(i in 1:length(rapportlinks_spa)){
+  sparnord[i,1] <- tryCatch(pdf_text_function_udenreadlines(rapportlinks_spa[[i]]) %>%
+                               str_extract(pattern = "[0-9]+\\.\\s[a-z][a-z][a-z]+\\s[0-9][0-9][0-9][0-9]") %>%
+                               as_data_frame(), error = function(e) 1)
+}
+
+sydbank <- data_frame( Dato=character(), Påbud=character() )
+for(i in 1:length(result_syd)){
+  sydbank[i,2] <- tryCatch(pdf_text_function(result_syd[[i]])%>%
+                                str_subset(pattern = "Banken fik påbud | fik banken påbud | fik påbud | blevet påbudt | har Finanstilsynet påbudt| påbud") %>%
+                                str_c(collapse = "|") %>%
+                                as_data_frame(), error = function(e) 1)}
+for(i in 1:length(result_syd)){
+  sydbank[i,1] <- tryCatch(pdf_text_function_udenreadlines(result_syd[[i]]) %>%
+                                str_extract(pattern = "[0-9]+\\.\\s[a-z][a-z][a-z]+\\s[0-9][0-9][0-9][0-9]") %>%
+                                as_data_frame(), error = function(e) 1)
+}
+
+```
+##Sammensætningen af informationerne til et overskueligt datasæt.
+Nu har jeg fire datasæt med to variable i hver: en variabel for datoen for den enkelte redegørelse og en variabel for ordlyden af påbudet. Disse datasæt skal nu samles, og der linket til hver enkelt pdf skal tilføjes, så man nemt kan finde hele redegørelsen. Derudover skal der laves en variabel, der viser 'Ja', hvis den enkelte pdf indeholder et påbud. 
+
+Nedenstående kode gør dette for Danske Bank datasættet, og samme proces gentages for alle datasæt.
+
+```{r, echo=TRUE, warning = FALSE, error = FALSE, message = FALSE}
+result_unlist <- unlist(result) %>%
+  as_data_frame() 
+danskebank_test <- danskebank %>%
+  mutate(Bank = as.character("Danske Bank")) %>%
+  bind_cols(result_unlist)%>%
+  mutate(Påbud = ifelse(Påbud == "", NA, Påbud)) %>%
+  mutate(Pdf_indeholder_påbud = ifelse(is.na(Påbud), "Nej", "Ja"))%>%
+  mutate(Dato=ifelse(Dato==1, NA, Dato))
+````
+
+```{r, echo=FALSE, warning = FALSE, error = FALSE, message = FALSE}
+
+result_jb_unlist <- unlist(result_jb) %>%
+  as_data_frame() 
+jyskebank_test <- jyskebank %>%
+  mutate(Bank = as.character("Jyske Bank"))%>%
+  bind_cols(result_jb_unlist)%>%
+  mutate(Påbud = ifelse(Påbud == "", NA, Påbud)) %>%
+  mutate(Pdf_indeholder_påbud = ifelse(is.na(Påbud), "Nej", "Ja"))%>%
+  mutate(Dato=ifelse(Dato==1, NA, Dato))
+
+result_sn_unlist <- unlist(result_spa) %>%
+  as_data_frame()
+sparnord_test <- sparnord %>%
+  mutate(Bank = as.character("Spar Nord"))%>%
+  bind_cols(result_sn_unlist)%>%
+  mutate(Påbud = ifelse(Påbud == "", NA, Påbud)) %>%
+  mutate(Pdf_indeholder_påbud = ifelse(is.na(Påbud), "Nej", "Ja"))%>%
+  mutate(Dato=ifelse(Dato==1, NA, Dato))
+
+result_syd_unlist <- unlist(result_syd) %>%
+  as_data_frame()
+sydbank_test <- sydbank %>%
+  mutate(Bank = as.character("Sydbank"))%>%
+  bind_cols(result_syd_unlist)%>%
+  mutate(Påbud = ifelse(Påbud == "", NA, Påbud)) %>%
+  mutate(Pdf_indeholder_påbud = ifelse(is.na(Påbud), "Nej", "Ja"))%>%
+  mutate(Dato=ifelse(Dato==1, NA, Dato))
+
+```
+
+Nu samles alle datasæt og det endelige datasæt pudses en smule til. 
+
+```{r, echo=TRUE, warning = FALSE, error = FALSE, message = FALSE}
+samlet_datasæt <- danskebank_test %>%
+  full_join(jyskebank_test)%>%
+  full_join(sparnord_test) %>%
+  full_join(sydbank_test) %>%
+  rename("PDF_link"=value)%>%
+  filter(!is.na(Dato))%>%
+  arrange(desc(Dato)) %>%
+  mutate(Påbud=ifelse(is.na(Påbud), "[INTET PÅBUD]", Påbud))
+```
+Herunder fremgår det endelige datasæt efter et par finpudsninger og en simpel analyse, der viser antallet af gange, der er identificeret en pdf med mindst ét påbud fra perioden 2010-2020.
+
+```{r, echo=FALSE, warning = FALSE, error = FALSE, message = FALSE}
+samlet_datasæt$Dato<- str_replace_all(samlet_datasæt$Dato,c("januar"="1", "\\." = "",
+                                                            "februar" = "2",
+                                                            "marts" = "3",
+                                                            "april" = "4",
+                                                            "maj" = "5",
+                                                            "juni" = "6",
+                                                            "juli" = "7",
+                                                            "august" = "8",
+                                                            "september" = "9",
+                                                            "oktober" = "10",
+                                                            "november" = "11",
+                                                            "december" = "12",
+                                                            "kvartal" = "3"
+                                                            ))
+samlet_datasæt$Dato <- as_date(dmy(samlet_datasæt$Dato))
+```
+```{r, echo=TRUE, warning=FALSE}
+head(samlet_datasæt, n=20)
+
+samlet_datasæt %>%
+  mutate(Påbud_dummy = ifelse(Pdf_indeholder_påbud=="Ja", 1, 0)) %>%
+  ggplot(aes(x=Bank, y=Påbud_dummy)) + geom_bar(stat="identity") +
+  scale_y_continuous("Antal redegørelser med påbud") +
+  ggtitle("Antal offentliggjorte redegørelser med mindst ét \n påbud i perioden 2010-2020") + theme_bw()+
+  theme(
+    plot.title = element_text(size=10, face="bold", hjust = 0.5),
+    axis.title.x = element_text(size=10, face="bold"),
+    axis.title.y = element_text(size=10, face="bold")
+  )
+
